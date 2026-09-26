@@ -28,31 +28,53 @@
     <div v-if="showBatch" class="batch-panel">
       <div class="hint">
         每行一条，格式 <code>标题|正文|话题|来源媒体</code>（话题、媒体可省）。统一渠道：
-        <select v-model="batchSource"><option v-for="s in store.sources" :key="s.id" :value="s.id">{{ s.name }}</option></select>
-        <span class="cnt">共 {{ batchCount }} 条 · 任一失败将整体回滚</span>
+        <select v-model="batchSource" :disabled="importing"><option v-for="s in store.sources" :key="s.id" :value="s.id">{{ s.name }}</option></select>
+        <span class="cnt">共 {{ batchCount }} 条 · 任务化导入：断点续传 · 失败重试 · 重复提交自动去重</span>
       </div>
-      <textarea v-model="batchText" rows="6" placeholder="某品牌售后拖延引投诉|多位用户反映客服响应慢，投诉量上升。|产品体验|澎湃新闻"></textarea>
+      <textarea v-model="batchText" rows="6" :disabled="importing" placeholder="某品牌售后拖延引投诉|多位用户反映客服响应慢，投诉量上升。|产品体验|澎湃新闻"></textarea>
       <div class="row">
-        <button class="save" :disabled="importing" @click="submitBatch">{{ importing ? '导入中…' : '校验并导入' }}</button>
-        <button class="ghost" @click="showBatch=false;batchResult=null;batchError=''">取消</button>
+        <button class="save" :disabled="importing || !batchCount" @click="submitBatch">
+          {{ importing ? `导入中 ${job ? job.processed + '/' + job.total : ''}…` : interrupted ? '继续导入' : '校验并导入' }}
+        </button>
+        <button v-if="job && job.failed && !importing" class="retry" @click="retryFailed">重试失败项（{{ job.failed }}）</button>
+        <button class="ghost" :disabled="importing" @click="resetBatch">取消</button>
+      </div>
+      <div v-if="job" class="progress">
+        <div class="bar"><i :style="{ width: pct + '%' }" :class="{ bad: job.failed }"></i></div>
+        <span class="ptext">
+          任务 #{{ job.id }} · {{ statusText(job.status) }} · 进度 {{ job.processed }}/{{ job.total }}
+          （成功 {{ job.succeeded }}<template v-if="job.failed"> · <b class="pfail">失败 {{ job.failed }}</b></template>）
+        </span>
       </div>
       <div v-if="batchError" class="err">
         ❌ {{ batchError }}
         <ul v-if="batchErrDetails.length"><li v-for="d in batchErrDetails" :key="d">{{ d }}</li></ul>
       </div>
-      <div v-if="batchResult" class="result">
+      <div v-if="jobDetail" class="result">
         <div class="sum">
-          ✅ 成功导入 {{ batchResult.imported }} 条，统计已刷新
-          <template v-if="batchResult.summary.alerts">
-            · 触发预警 {{ batchResult.summary.alerts }} 次（自动建档 {{ batchResult.summary.crisesCreated }} · 并入 {{ batchResult.summary.crisesMerged }}）
+          <template v-if="jobDetail.status === 'done'">✅ 任务 #{{ jobDetail.id }} 全部完成，共导入 {{ jobDetail.succeeded }} 条，统计已刷新</template>
+          <template v-else>⚠️ 任务 #{{ jobDetail.id }} 完成 {{ jobDetail.succeeded }}/{{ jobDetail.total }} 条，{{ jobDetail.failed }} 条失败（可重试）</template>
+          <template v-if="jobDetail.summary && jobDetail.summary.alerts">
+            · 触发预警 {{ jobDetail.summary.alerts }} 次（自动建档 {{ jobDetail.summary.crisesCreated }} · 并入 {{ jobDetail.summary.crisesMerged }}）
           </template>
         </div>
-        <div v-for="(r, i) in batchResult.results" :key="r.id" class="ritem">
-          <span class="no">#{{ i + 1 }}</span>
-          <span class="chip sent" :class="r.sentiment">{{ sentText(r.sentiment) }}</span>
-          <span class="heat">热度 {{ r.heat }}</span>
-          <span class="rt">{{ r.title }}</span>
-          <span v-if="r.triggered.length" class="trig">⚠️ {{ trigText(r.triggered) }}</span>
+        <div v-for="it in jobDetail.items" :key="it.seq" class="ritem">
+          <span class="no">#{{ it.seq + 1 }}</span>
+          <template v-if="it.status === 'done' && it.result">
+            <span class="chip sent" :class="it.result.sentiment">{{ sentText(it.result.sentiment) }}</span>
+            <span class="heat">热度 {{ it.result.heat }}</span>
+            <span class="rt">{{ it.title }}</span>
+            <span v-if="it.result.triggered.length" class="trig">⚠️ {{ trigText(it.result.triggered) }}</span>
+          </template>
+          <template v-else-if="it.status === 'failed'">
+            <span class="chip failed">失败</span>
+            <span class="rt">{{ it.title }}</span>
+            <span class="ferr">{{ it.error }}（已试 {{ it.attempts }} 次）</span>
+          </template>
+          <template v-else>
+            <span class="chip pending">待处理</span>
+            <span class="rt">{{ it.title }}</span>
+          </template>
         </div>
       </div>
     </div>
@@ -91,11 +113,22 @@ const showBatch = ref(false)
 const batchText = ref('')
 const batchSource = ref(1)
 const importing = ref(false)
-const batchResult = ref(null)
+const interrupted = ref(false) // 导入中断（网络/服务异常）：任务进度已落库，可断点续传
+const job = ref(null)          // 当前导入任务进度快照
+const jobDetail = ref(null)    // 任务完成后的逐条结果（结果回写）
 const batchError = ref('')
 const batchErrDetails = ref([])
 
 const batchCount = computed(() => batchText.value.split('\n').filter((l) => l.trim()).length)
+const pct = computed(() => (job.value && job.value.total ? Math.round((job.value.processed / job.value.total) * 100) : 0))
+
+// 幂等标识：由导入内容哈希生成 —— 相同内容重复提交/中断重提自动对应同一任务，不产生重复批次
+function hashKey(s) {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0
+  return `web-${h.toString(36)}`
+}
+const batchKey = computed(() => hashKey(`${batchSource.value}\n${batchText.value.trim()}`))
 
 async function load() {
   const qs = {}
@@ -124,19 +157,61 @@ function parseBatch() {
   })
   return { items, errs }
 }
+const IMPORT_CHUNK = 50 // 每个分片处理条数：分片推进，进度实时可见、中断可续
 async function submitBatch() {
-  batchError.value = ''; batchErrDetails.value = []; batchResult.value = null
+  batchError.value = ''; batchErrDetails.value = []
+  if (interrupted.value && job.value) { await runLoop(job.value.id); return } // 断点续传：直接恢复既有任务
   const { items, errs } = parseBatch()
-  if (errs.length) { batchError.value = '格式校验未通过，未导入任何数据'; batchErrDetails.value = errs; return }
+  if (errs.length) { batchError.value = '格式校验未通过，未创建导入任务'; batchErrDetails.value = errs; return }
   if (!items.length) { batchError.value = '没有可导入的数据'; return }
   importing.value = true
   try {
-    batchResult.value = await store.importPosts(items)
-    batchText.value = ''
+    const r = await store.createImportJob(batchKey.value, items) // 幂等：同内容重复提交返回同一任务
+    job.value = r.job
+    jobDetail.value = null
+    await runLoop(r.job.id)
+  } catch (e) {
+    batchError.value = e.message
+    if (e.details) batchErrDetails.value = e.details
+  } finally { importing.value = false }
+}
+// 分片执行直至任务收敛（done/partial/failed）；异常时保留断点，可继续导入
+async function runLoop(id) {
+  importing.value = true
+  interrupted.value = false
+  try {
+    for (let guard = 0; guard < 1000; guard++) {
+      const j = await store.runImportJob(id, IMPORT_CHUNK)
+      job.value = j
+      if (j.status !== 'running' && j.status !== 'pending') break
+    }
+    jobDetail.value = await store.fetchImportJob(id) // 结果回写：逐条明细 + 触发汇总
+    await store.finishImportJob(job.value)
+    if (job.value.status === 'done') batchText.value = ''
     load()
   } catch (e) {
-    batchError.value = e.message // 后端已整体回滚
+    interrupted.value = true
+    batchError.value = `导入中断：${e.message}。已完成部分不会重复导入，点击「继续导入」从断点恢复。`
   } finally { importing.value = false }
+}
+// 失败重试：重置失败条目后断点续跑
+async function retryFailed() {
+  if (!job.value) return
+  batchError.value = ''
+  importing.value = true
+  try {
+    await store.retryImportJob(job.value.id)
+    await runLoop(job.value.id)
+  } catch (e) { batchError.value = e.message; interrupted.value = true }
+  finally { importing.value = false }
+}
+function resetBatch() {
+  showBatch.value = false
+  batchError.value = ''; batchErrDetails.value = []
+  job.value = null; jobDetail.value = null; interrupted.value = false
+}
+function statusText(s) {
+  return { pending: '待执行', running: '执行中', done: '已完成', partial: '部分完成', failed: '失败' }[s] || s
 }
 function trigText(triggered) {
   return triggered.map((t) =>
@@ -165,6 +240,16 @@ textarea{resize:vertical;min-height:56px;}
 .batch-panel textarea{width:100%;box-sizing:border-box;}
 .err{background:#3a1215;border:1px solid #b71c1c;color:#ef9a9a;border-radius:8px;padding:10px 12px;font-size:12px;}
 .err ul{margin:6px 0 0;padding-left:18px;}
+.retry{background:linear-gradient(135deg,#f9a825,#f57f17);border:none;color:#fff;font-weight:600;cursor:pointer;}
+.progress{display:flex;align-items:center;gap:10px;}
+.progress .bar{flex:0 0 180px;height:8px;background:#0c1730;border-radius:4px;overflow:hidden;}
+.progress .bar i{display:block;height:100%;background:linear-gradient(90deg,#00897b,#26a69a);transition:width .2s;}
+.progress .bar i.bad{background:linear-gradient(90deg,#00897b,#f9a825);}
+.progress .ptext{font-size:11px;color:#8ba2c8;}
+.progress .pfail{color:#ef9a9a;}
+.chip.failed{background:#b71c1c;color:#ffcdd2;}
+.chip.pending{background:#37474f;color:#b0bec5;}
+.ferr{color:#ef9a9a;font-size:11px;}
 .result{background:#0c1730;border:1px solid rgba(120,160,220,0.16);border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:6px;}
 .result .sum{color:#a5d6a7;font-size:12px;font-weight:600;}
 .ritem{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:#aebadd;border-top:1px dashed rgba(120,160,220,0.12);padding-top:6px;}

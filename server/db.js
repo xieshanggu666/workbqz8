@@ -86,6 +86,31 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   note TEXT NOT NULL DEFAULT '',
   time TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS import_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idem_key TEXT NOT NULL UNIQUE,     -- 幂等标识：同键重复提交返回同一任务，不产生重复批次
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/running/done/partial/failed
+  total INTEGER NOT NULL,
+  processed INTEGER NOT NULL DEFAULT 0,   -- 进度：已处理（成功+失败）
+  succeeded INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  summary TEXT NOT NULL DEFAULT '',  -- JSON：预警/危机触发汇总（结果回写）
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS import_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL,              -- 批次内序号（与任务键共同构成条目级幂等定位）
+  payload TEXT NOT NULL,             -- 原始条目 JSON
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/done/failed
+  attempts INTEGER NOT NULL DEFAULT 0,    -- 已尝试次数（失败重试计数）
+  post_id INTEGER,                   -- 落库舆情 id（结果回写）
+  result TEXT NOT NULL DEFAULT '',   -- JSON：情感分析 + 预警/危机触发明细（结果回写）
+  error TEXT NOT NULL DEFAULT '',
+  updated TEXT NOT NULL,
+  UNIQUE (job_id, seq)
+);
 `)
 
 // 把 toLocaleString('zh-CN') 形如「2026/9/26 01:54:38」解析为毫秒时间戳（迁移/窗口计算用）

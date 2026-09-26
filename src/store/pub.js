@@ -6,7 +6,11 @@ async function api(path, method = 'GET', body, qs) {
   if (body) opt.body = JSON.stringify(body)
   const r = await fetch(url, opt)
   const data = await r.json()
-  if (!r.ok) throw new Error(data.error || '请求失败')
+  if (!r.ok) {
+    const err = new Error(data.error || '请求失败')
+    err.details = data.details || [] // 校验明细（批量导入逐条定位）
+    throw err
+  }
   return data
 }
 
@@ -37,17 +41,28 @@ export const usePubStore = defineStore('pub', {
       } else this.msg('舆情已收录' + (r.sentiment === 'negative' ? '（负面）' : ''), 'success')
       return r
     },
-    // 批量导入：后端事务处理、失败整体回滚；成功后刷新统计并汇总提示
-    async importPosts(items) {
-      const r = await api('/posts/batch', 'POST', { items })
-      await this.load() // 统计刷新
-      const s = r.summary
+    // ===== 可恢复批量导入任务 =====
+    // 创建任务（幂等：同 idempotencyKey 重复提交返回既有任务）
+    async createImportJob(idempotencyKey, items) {
+      return await api('/import/jobs', 'POST', { idempotencyKey, items })
+    },
+    // 执行/恢复一个分片，返回最新进度
+    async runImportJob(id, limit) { return (await api(`/import/jobs/${id}/run`, 'POST', { limit })).job },
+    // 重置失败条目（恢复重试额度）
+    async retryImportJob(id) { return (await api(`/import/jobs/${id}/retry`, 'POST')) },
+    // 任务详情（进度 + 逐条结果回写）
+    async fetchImportJob(id) { return await api(`/import/jobs/${id}`) },
+    // 任务完成后：刷新统计并汇总提示（预警/危机闭环结果）
+    async finishImportJob(job) {
+      await this.load()
+      const s = job.summary || {}
       const parts = []
       if (s.alerts) parts.push(`触发预警 ${s.alerts} 次`)
       if (s.crisesCreated) parts.push(`危机自动建档 ${s.crisesCreated} 起`)
       if (s.crisesMerged) parts.push(`并入既有危机 ${s.crisesMerged} 次`)
-      this.msg(`批量导入 ${r.imported} 条舆情` + (parts.length ? '：' + parts.join('，') : ''), s.alerts ? 'warn' : 'success')
-      return r
+      if (job.failed) parts.push(`${job.failed} 条失败可重试`)
+      this.msg(`导入任务 #${job.id} 完成 ${job.succeeded}/${job.total} 条` + (parts.length ? '：' + parts.join('，') : ''),
+        job.failed || s.alerts ? 'warn' : 'success')
     },
     async fetchAlerts() { return await api('/alerts') },
     async saveAlert(a) { await api('/alerts', 'POST', a); await this.load(); this.msg('预警规则已保存', 'success') },

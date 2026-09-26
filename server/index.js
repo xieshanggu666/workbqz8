@@ -168,6 +168,158 @@ app.post('/api/posts/batch', (req, res) => {
   })
 })
 
+// ===== 可恢复批量导入任务 =====
+// 任务化导入：幂等建档 → 分片执行（每条独立事务，进度实时落库）→ 失败重试 → 结果回写。
+// 与单条/整批录入共用 ingestPost 管线，预警触发与危机建档/归并闭环完全一致。
+const IMPORT_MAX = 2000      // 单任务最大条数（大批量走任务化导入）
+const IMPORT_CHUNK_MAX = 500 // 单次 run 最多处理条数（分片推进，便于断点续传）
+const ITEM_MAX_ATTEMPTS = 3  // 单条最大尝试次数（run 自动重试失败项）
+
+// 任务快照（进度 + 可选逐条结果回写）
+function jobSnapshot(id, withItems = false) {
+  const job = q1('SELECT * FROM import_jobs WHERE id=?', id)
+  if (!job) return null
+  const out = {
+    id: job.id, idempotencyKey: job.idem_key, status: job.status,
+    total: job.total, processed: job.processed, succeeded: job.succeeded, failed: job.failed,
+    summary: job.summary ? JSON.parse(job.summary) : null,
+    created: job.created, updated: job.updated
+  }
+  if (withItems) {
+    out.items = q('SELECT * FROM import_items WHERE job_id=? ORDER BY seq', id).map((it) => {
+      let title = '', result = null
+      try { title = JSON.parse(it.payload).title } catch { title = '（条目数据损坏）' }
+      try { result = it.result ? JSON.parse(it.result) : null } catch { /* 结果回写损坏时仅省略明细 */ }
+      return { seq: it.seq, status: it.status, attempts: it.attempts, postId: it.post_id, title, error: it.error || '', result }
+    })
+  }
+  return out
+}
+
+// 计数器始终由条目表推导，避免中途崩溃导致进度失真
+function refreshJobCounters(jobId) {
+  run(`UPDATE import_jobs SET
+    processed=(SELECT COUNT(*) FROM import_items WHERE job_id=? AND status!='pending'),
+    succeeded=(SELECT COUNT(*) FROM import_items WHERE job_id=? AND status='done'),
+    failed=(SELECT COUNT(*) FROM import_items WHERE job_id=? AND status='failed'),
+    updated=? WHERE id=?`, jobId, jobId, jobId, now(), jobId)
+}
+
+// 汇总逐条结果并回写任务（预警/危机闭环触发情况 + 最新统计）
+function finalizeJob(jobId) {
+  refreshJobCounters(jobId)
+  const left = q1(`SELECT
+      SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,
+      SUM(CASE WHEN status='failed' AND attempts<? THEN 1 ELSE 0 END) retryable
+    FROM import_items WHERE job_id=?`, ITEM_MAX_ATTEMPTS, jobId)
+  if (left.pending > 0 || left.retryable > 0) {
+    run("UPDATE import_jobs SET status='running', updated=? WHERE id=?", now(), jobId)
+    return // 仍有待处理/可重试条目：分片执行中，可继续 run
+  }
+  const job = q1('SELECT * FROM import_jobs WHERE id=?', jobId)
+  const status = job.failed === 0 ? 'done' : job.succeeded > 0 ? 'partial' : 'failed'
+  let alerts = 0, crisesCreated = 0, crisesMerged = 0
+  for (const r of q("SELECT result FROM import_items WHERE job_id=? AND status='done'", jobId)) {
+    for (const t of (JSON.parse(r.result).triggered || [])) {
+      alerts++
+      if (t.crisisId && !t.deduped) crisesCreated++
+      if (t.deduped) crisesMerged++
+    }
+  }
+  const summary = { alerts, crisesCreated, crisesMerged, stats: statsSummary() }
+  run('UPDATE import_jobs SET status=?, summary=?, updated=? WHERE id=?', status, JSON.stringify(summary), now(), jobId)
+}
+
+// 执行/恢复任务：逐条独立事务（舆情落库+预警危机闭环+进度回写同生共死），失败条目隔离不影响整批
+function runImportJob(jobId, limit) {
+  const job = q1('SELECT * FROM import_jobs WHERE id=?', jobId)
+  if (!job) return null
+  if (job.status === 'done') return jobSnapshot(jobId) // 幂等：已完成任务重复 run 直接返回结果
+  const items = q(`SELECT * FROM import_items WHERE job_id=?
+    AND (status='pending' OR (status='failed' AND attempts<?)) ORDER BY seq LIMIT ?`, jobId, ITEM_MAX_ATTEMPTS, limit)
+  for (const it of items) {
+    db.exec('BEGIN')
+    try {
+      const r = ingestPost(JSON.parse(it.payload))
+      run("UPDATE import_items SET status='done', attempts=attempts+1, post_id=?, result=?, error='', updated=? WHERE id=?",
+        r.id, JSON.stringify(r), now(), it.id)
+      db.exec('COMMIT')
+    } catch (e) {
+      try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
+      // 失败记录与重试计数落库（条目级隔离，整批继续推进）
+      run("UPDATE import_items SET status='failed', attempts=attempts+1, error=?, updated=? WHERE id=?",
+        String((e && e.message) || e), now(), it.id)
+    }
+    refreshJobCounters(jobId) // 进度实时落库，中断后可从断点恢复
+  }
+  finalizeJob(jobId)
+  return jobSnapshot(jobId)
+}
+
+// 创建导入任务（幂等：同一 idempotencyKey 重复提交返回既有任务，不产生重复批次）
+app.post('/api/import/jobs', (req, res) => {
+  const key = String((req.body && req.body.idempotencyKey) || '').trim()
+  const items = req.body && req.body.items
+  if (!key) return res.status(400).json({ error: '缺少幂等标识 idempotencyKey' })
+  const existing = q1('SELECT id FROM import_jobs WHERE idem_key=?', key)
+  if (existing) return res.json({ ok: true, deduped: true, job: jobSnapshot(existing.id) })
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items 不能为空' })
+  if (items.length > IMPORT_MAX) return res.status(400).json({ error: `单任务最多导入 ${IMPORT_MAX} 条` })
+  // 整批预校验：确定性错误（标题/正文缺失）直接拒绝，重试无意义，不落任务
+  const errors = items.map((it, i) => validateItem(it, i)).filter(Boolean)
+  if (errors.length) return res.status(400).json({ error: '校验失败，未创建导入任务', details: errors })
+
+  db.exec('BEGIN')
+  let jobId
+  try {
+    jobId = Number(run('INSERT INTO import_jobs (idem_key,status,total,created,updated) VALUES (?,?,?,?,?)',
+      key, 'pending', items.length, now(), now()).lastInsertRowid)
+    items.forEach((it, i) => run('INSERT INTO import_items (job_id,seq,payload,updated) VALUES (?,?,?,?)',
+      jobId, i, JSON.stringify({ title: it.title, content: it.content, source_id: it.source_id, topic: it.topic, media: it.media }), now()))
+    db.exec('COMMIT')
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
+    if (String(e.message).includes('UNIQUE')) { // 并发下同键撞库：返回既有任务
+      const dup = q1('SELECT id FROM import_jobs WHERE idem_key=?', key)
+      if (dup) return res.json({ ok: true, deduped: true, job: jobSnapshot(dup.id) })
+    }
+    return res.status(500).json({ error: `创建导入任务失败：${e.message}` })
+  }
+  res.json({ ok: true, deduped: false, job: jobSnapshot(jobId) })
+})
+
+// 任务列表（最近 20 个，含进度）
+app.get('/api/import/jobs', (req, res) => {
+  res.json(q('SELECT id FROM import_jobs ORDER BY id DESC LIMIT 20').map((j) => jobSnapshot(j.id)))
+})
+
+// 任务详情：进度 + 逐条结果回写
+app.get('/api/import/jobs/:id', (req, res) => {
+  const snap = jobSnapshot(+req.params.id, true)
+  if (!snap) return res.status(404).json({ error: '任务不存在' })
+  res.json(snap)
+})
+
+// 执行/恢复：分片处理待办与可重试条目，中断后重复调用即可从断点继续
+app.post('/api/import/jobs/:id/run', (req, res) => {
+  const limit = Math.max(1, Math.min(IMPORT_CHUNK_MAX, +((req.body || {}).limit) || IMPORT_CHUNK_MAX))
+  const snap = runImportJob(+req.params.id, limit)
+  if (!snap) return res.status(404).json({ error: '任务不存在' })
+  res.json({ ok: true, job: snap })
+})
+
+// 失败重试：重置失败条目（恢复重试额度），随后由 run 继续执行
+app.post('/api/import/jobs/:id/retry', (req, res) => {
+  const job = q1('SELECT * FROM import_jobs WHERE id=?', +req.params.id)
+  if (!job) return res.status(404).json({ error: '任务不存在' })
+  const n = q1("SELECT COUNT(*) c FROM import_items WHERE job_id=? AND status='failed'", job.id).c
+  if (!n) return res.json({ ok: true, reset: 0, job: jobSnapshot(job.id) })
+  run("UPDATE import_items SET status='pending', attempts=0, error='', updated=? WHERE job_id=? AND status='failed'", now(), job.id)
+  refreshJobCounters(job.id)
+  run("UPDATE import_jobs SET status='pending', summary='', updated=? WHERE id=?", now(), job.id)
+  res.json({ ok: true, reset: n, job: jobSnapshot(job.id) })
+})
+
 function checkAlerts(postId) {
   const p = q1('SELECT * FROM posts WHERE id=?', postId)
   const alerts = q('SELECT * FROM alerts WHERE active=1')
