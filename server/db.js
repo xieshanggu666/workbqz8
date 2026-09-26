@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-export const db = new DatabaseSync(path.join(__dirname, 'pubmon.db'))
+export const db = new DatabaseSync(process.env.PUBMON_DB || path.join(__dirname, 'pubmon.db'))
 
 db.exec('PRAGMA foreign_keys = ON;')
 
@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS posts (
   topic TEXT NOT NULL,
   media TEXT NOT NULL DEFAULT '',
   published TEXT NOT NULL,
-  created TEXT NOT NULL
+  created TEXT NOT NULL,
+  idem_key TEXT                   -- 条目幂等键（导入任务重试/断点续传去重，手工录入为 NULL）
 );
 CREATE TABLE IF NOT EXISTS hot_words (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +87,41 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   note TEXT NOT NULL DEFAULT '',
   time TEXT NOT NULL
 );
+-- 可恢复批量导入：任务主表（幂等标识、状态机、进度、结果汇总）
+CREATE TABLE IF NOT EXISTS import_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  idem_key TEXT NOT NULL UNIQUE,  -- 任务幂等键：同键重复提交直接返回原任务
+  total INTEGER NOT NULL DEFAULT 0,
+  total_ok INTEGER NOT NULL DEFAULT 0,
+  total_failed INTEGER NOT NULL DEFAULT 0,
+  total_duplicate INTEGER NOT NULL DEFAULT 0,
+  alerts_fired INTEGER NOT NULL DEFAULT 0,
+  crises_created INTEGER NOT NULL DEFAULT 0,
+  crises_merged INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/running/paused/done/failed（failed=跑完仍有失败条目）
+  attempts INTEGER NOT NULL DEFAULT 0,    -- 任务级执行轮次（用于中断/失败后恢复）
+  last_error TEXT NOT NULL DEFAULT '',
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL,
+  finished TEXT
+);
+-- 逐条记录：状态与结果用于进度展示、失败重试、结果回写
+CREATE TABLE IF NOT EXISTS import_job_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL,           -- 批内序号（从 0 开始）
+  idem_key TEXT NOT NULL,         -- 条目幂等键（去重在 posts 唯一索引上判定；不同任务可有同名键）
+  payload TEXT NOT NULL,          -- 原始录入 JSON
+  status TEXT NOT NULL DEFAULT 'pending', -- pending/success/failed/duplicate
+  attempts INTEGER NOT NULL DEFAULT 0,
+  result TEXT NOT NULL DEFAULT '',        -- 成功结果 JSON（含触发预警）
+  error TEXT NOT NULL DEFAULT '',
+  post_id INTEGER,
+  UNIQUE (job_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_import_job_items_job ON import_job_items (job_id, status);
+CREATE INDEX IF NOT EXISTS idx_import_job_items_key ON import_job_items (idem_key);
+CREATE INDEX IF NOT EXISTS idx_posts_idem_key ON posts (idem_key) WHERE idem_key IS NOT NULL;
 `)
 
 // 把 toLocaleString('zh-CN') 形如「2026/9/26 01:54:38」解析为毫秒时间戳（迁移/窗口计算用）
@@ -112,6 +148,46 @@ ensureColumn('alerts', 'merge_topic', "merge_topic TEXT NOT NULL DEFAULT ''")
 ensureColumn('alerts', 'merge_window', 'merge_window INTEGER NOT NULL DEFAULT 0')
 ensureColumn('crisis', 'topic', "topic TEXT NOT NULL DEFAULT ''")
 ensureColumn('crisis', 'last_trigger_at', 'last_trigger_at INTEGER')
+ensureColumn('posts', 'idem_key', 'idem_key TEXT')
+db.exec('CREATE INDEX IF NOT EXISTS idx_posts_idem_key ON posts (idem_key) WHERE idem_key IS NOT NULL;')
+
+// 迁移：早期版本 import_job_items.idem_key 为全局唯一，跨任务内容去重时同名键会冲突，
+// 重建表去掉该唯一约束（保留 (job_id, seq) 唯一与普通索引）。
+function migrateJobItemsKeyUnique() {
+  const idxList = db.prepare("PRAGMA index_list('import_job_items')").all()
+  let bad = null
+  for (const ix of idxList) {
+    if (!ix.unique) continue
+    const cols = db.prepare(`PRAGMA index_info('${ix.name}')`).all().map((c) => c.name)
+    // 仅 idem_key 单列唯一的索引是旧约束（(job_id,seq) 复合唯一保留）
+    if (cols.length === 1 && cols[0] === 'idem_key') { bad = ix; break }
+  }
+  if (!bad) return
+  const cols = db.prepare('PRAGMA table_info(import_job_items)').all().map((c) => c.name)
+  if (!cols.includes('idem_key')) return
+  db.exec(`
+    CREATE TABLE import_job_items_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id INTEGER NOT NULL,
+      seq INTEGER NOT NULL,
+      idem_key TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      result TEXT NOT NULL DEFAULT '',
+      error TEXT NOT NULL DEFAULT '',
+      post_id INTEGER,
+      UNIQUE (job_id, seq)
+    );
+    INSERT INTO import_job_items_new (id,job_id,seq,idem_key,payload,status,attempts,result,error,post_id)
+      SELECT id,job_id,seq,idem_key,payload,status,attempts,result,error,post_id FROM import_job_items;
+    DROP TABLE import_job_items;
+    ALTER TABLE import_job_items_new RENAME TO import_job_items;
+    CREATE INDEX IF NOT EXISTS idx_import_job_items_job ON import_job_items (job_id, status);
+    CREATE INDEX IF NOT EXISTS idx_import_job_items_key ON import_job_items (idem_key);
+  `)
+}
+migrateJobItemsKeyUnique()
 
 // 旧关联迁移：crisis.alert_id 单规则 → crisis_alerts 多对多；回填话题与最近触发时间。
 // 幂等：仅在关联表为空时执行，历史时间线（crisis_timeline）原样保留。

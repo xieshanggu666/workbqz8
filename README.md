@@ -20,7 +20,7 @@ npm run dev
 ## 功能
 
 - **舆情总览**：总量/正面/中性/负面/热点/负面占比统计、情感分布环形图、7 时段热度趋势、渠道来源分布、高频热词云、生效预警规则、危机速览
-- **舆情列表**：按情感/渠道/关键词筛选，录入新舆情自动进行情感分析，负面舆情触发预警提示；支持批量导入（每行一条），整批事务处理、任一失败整体回滚，导入后统一刷新统计
+- **舆情列表**：按情感/渠道/关键词筛选，录入新舆情自动进行情感分析，负面舆情触发预警提示；支持可恢复批量导入（任务化、断点续跑、失败重试、进度与逐条结果回写）
 - **预警中心**：预警规则配置（级别/关键词/情感/热度下限/归并话题/时间窗口），规则启停、触发记录与关联舆情、单条/批量解除预警
 - **危机处置**：事件建档（话题+方案+研判+邮箱）、状态流转（监测→处置→结案）、处置时间线、动作记录、事件回溯（按规则拆分统计）与结案总结
 
@@ -32,18 +32,25 @@ npm run dev
 - **状态同步**：预警解除 → 危机时间线同步记录（标注来源规则）；危机结案 → 级联解除关联的全部未解除预警（可能横跨多条规则）
 - **回溯结案**：危机事件支持回溯（按规则拆分的触发统计、关联舆情、完整时间线），结案时写入回溯总结完成闭环
 
-## 批量导入
+## 批量导入（可恢复任务）
 
-- `POST /api/posts/batch`：`{ items: [{ title, content, source_id, topic, media }] }`，单次最多 200 条
-- 与单条录入共用同一管线：逐条情感分析 → 落库 → 预警触发 → 红/橙级危机自动建档或去重并入
-- 整批预校验 + 事务执行，任一条失败整体回滚；成功后返回逐条结果、触发汇总与最新统计
-- `POST /api/posts` 单条录入保持兼容，内部走同一管线，响应结构不变
+- `POST /api/imports`：`{ idem_key?, items: [{ title, content, source_id, topic, media, idem_key? }] }`，单任务上限 **5000 条**；返回 `202 + jobId`，任务异步分块执行（每块 25 条独立事务，块间让出事件循环）
+- **双层幂等**：
+  - 任务键 `idem_key`：同一批数据重复提交（网络抖动/双击/刷新）直接返回原任务，不重复执行
+  - 条目键（`posts.idem_key` 唯一索引）：自动为 `任务键:序号`；也支持条目自带 `idem_key` 做跨批次内容去重。重试/续跑/重复提交命中已有舆情时跳过，**绝不重复触发预警、重复建档/归并危机**
+- **失败重试**：单条失败用 `SAVEPOINT` 只回滚该条，自动重试至多 3 次；仍失败标记 `failed`，任务以 `failed`（部分失败）结束，可一键重试失败条目续跑；瞬时故障不影响同块其他条目
+- **进度记录**：任务与逐条状态（pending/success/failed/duplicate、attempts、结果 JSON、错误）实时落库；`GET /api/imports/:id` 回写进度、预警/危机汇总与逐条结果；支持暂停 / 续跑
+- **崩溃恢复**：服务重启时把 running/pending 任务转为「已暂停」并保留已提交块的进度，一键续跑断点恢复（不丢、不重）
+- **闭环衔接**：每条仍走统一管线（情感分析 → 落库 → 预警触发 → 红/橙级危机自动建档或同话题窗口归并），分块提交让大批量导入时预警/危机边导入边闭环
+- 其他接口：`GET /api/imports`（最近任务）、`POST /api/imports/:id/pause`、`POST /api/imports/:id/resume`（兼作失败重试）
+- 演练用请求头：`x-sim-fail: 2,5`（指定条目首轮瞬时失败，验证自动重试）、`x-sim-fail-always: 5`（持续失败，验证 failed → 手动重试）、续跑时带 `x-clear-injection: 1`
+- `POST /api/posts/batch`（旧接口，≤200 条）保持同步语义，内部改为创建任务并等待结束，响应结构不变（部分失败返回 207）；`POST /api/posts` 单条录入支持可选 `idem_key`，响应结构不变
 
 ## 数据库表
 
-`sources` `posts` `hot_words` `alerts` `alert_events` `crisis` `crisis_alerts` `crisis_timeline`
+`sources` `posts`（含 `idem_key` 幂等键） `hot_words` `alerts` `alert_events` `crisis` `crisis_alerts` `crisis_timeline` `import_jobs` `import_job_items`（可恢复导入任务与逐条记录）
 
-> 旧库自动迁移：新增 `alerts.merge_topic/merge_window`、`crisis.topic/last_trigger_at` 列，并把旧的 `crisis.alert_id` 单规则关联迁移到多对多表 `crisis_alerts`（回填话题与最近触发时间），历史时间线原样保留。
+> 旧库自动迁移：新增 `alerts.merge_topic/merge_window`、`crisis.topic/last_trigger_at` 列，并把旧的 `crisis.alert_id` 单规则关联迁移到多对多表 `crisis_alerts`（回填话题与最近触发时间），历史时间线原样保留；新增 `posts.idem_key` 列与索引，并自动重建早期版本的 `import_job_items.idem_key` 唯一约束为普通索引（支持跨任务同名幂等键）。
 
 ## 后续可扩展
 

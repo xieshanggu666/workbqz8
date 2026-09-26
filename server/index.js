@@ -1,17 +1,22 @@
 import express from 'express'
-import { db, parseTimeMs } from './db.js'
+import { db } from './db.js'
+import {
+  now, statsSummary, validateItem, ingestPost
+} from './pipeline.js'
+import {
+  JOB_MAX, createJob, getJob, listJobs, resumeJob, pauseJob, recoverInterrupted
+} from './import-engine.js'
 
 const app = express()
-app.use(express.json())
+app.use(express.json({ limit: '5mb' })) // 大批量导入（上限 5000 条）
 
 const q = (sql, ...p) => db.prepare(sql).all(...p)
 const q1 = (sql, ...p) => db.prepare(sql).get(...p)
 const run = (sql, ...p) => db.prepare(sql).run(...p)
-const now = () => new Date().toLocaleString('zh-CN')
 
-// 高等级预警（红/橙）触发时自动建档危机事件
-const AUTO_LEVELS = ['red', 'orange']
-const LV_TEXT = { red: '红色', orange: '橙色', yellow: '黄色' }
+// 启动恢复：崩溃/重启时未完成的导入任务转「已暂停」，保留进度，等待续跑
+const recovered = recoverInterrupted()
+if (recovered) console.log(`[PUBMON] 恢复 ${recovered} 个中断的批量导入任务（已暂停，可续跑）`)
 
 // 危机列表（含来源规则、承接规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
@@ -26,37 +31,6 @@ function crisisList(withTimeline = false) {
     if (withTimeline) item.timeline = q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id DESC', c.id)
     return item
   })
-}
-
-// 承接某事件的规则关联（无则插入），刷新最近触发时间
-function attachRule(crisisId, alertId, isOrigin, timeStr) {
-  const exists = q1('SELECT 1 FROM crisis_alerts WHERE crisis_id=? AND alert_id=?', crisisId, alertId)
-  if (exists) run('UPDATE crisis_alerts SET last_at=?, is_origin=MAX(is_origin,?) WHERE crisis_id=? AND alert_id=?', timeStr, isOrigin ? 1 : 0, crisisId, alertId)
-  else run('INSERT INTO crisis_alerts (crisis_id,alert_id,is_origin,first_at,last_at) VALUES (?,?,?,?,?)', crisisId, alertId, isOrigin ? 1 : 0, timeStr, timeStr)
-}
-
-// 简易情感打分（演示用，规则匹配）
-const NEG = ['慢', '卫生', '投诉', '延期', '质疑', '故障', '涨价', '维权', '不满', '告', '退款', '坑', '吐槽', '回应迟']
-const POS = ['好评', '回升', '利好', '积极', '满意', '点赞', '惠民', '提升', '突破', '肯定', '有效']
-function analyze(text) {
-  let score = 0
-  NEG.forEach((w) => { if (text.includes(w)) score -= 0.5 })
-  POS.forEach((w) => { if (text.includes(w)) score += 0.5 })
-  score = Math.max(-1, Math.min(1, score))
-  return { sentiment: score < -0.2 ? 'negative' : score > 0.2 ? 'positive' : 'neutral', score }
-}
-
-// 总览统计（单条/批量录入后统一刷新）
-function statsSummary(posts = q('SELECT * FROM posts')) {
-  const total = posts.length
-  const pos = posts.filter((p) => p.sentiment === 'positive').length
-  const neg = posts.filter((p) => p.sentiment === 'negative').length
-  return {
-    total, pos, neg, neu: total - pos - neg,
-    negRate: total ? Math.round((neg / total) * 100) : 0,
-    hot: posts.filter((p) => p.hot).length,
-    topHeat: Math.max(...posts.map((p) => p.heat), 0)
-  }
 }
 
 // ===== 总览 =====
@@ -99,130 +73,108 @@ app.get('/api/topics', (req, res) => {
   res.json(db.prepare('SELECT DISTINCT topic FROM posts').all().map((r) => r.topic))
 })
 
-// 录入校验：标题/正文必填（批量导入时按条定位错误）
-function validateItem(it, idx) {
-  const errs = []
-  if (!it || typeof it !== 'object') errs.push('格式错误')
-  else {
-    if (typeof it.title !== 'string' || !it.title.trim()) errs.push('缺少标题')
-    if (typeof it.content !== 'string' || !it.content.trim()) errs.push('缺少正文')
-  }
-  return errs.length ? `第${idx + 1}条：${errs.join('、')}` : null
-}
-
-// 统一录入管线：逐条情感分析 → 落库 → 预警检查（红/橙级自动建档危机或去重并入）
-function ingestPost(item) {
-  const title = (item.title || '').trim()
-  const content = (item.content || '').trim()
-  const text = title + ' ' + content
-  const a = analyze(text)
-  // 热度与负面关键词命中数挂钩，便于稳定演示预警触发
-  const negHits = NEG.filter((w) => text.includes(w)).length
-  const heat = Math.min(100, 35 + negHits * 12 + Math.round(Math.random() * 12) + (a.sentiment === 'negative' ? 8 : 0))
-  const r = run('INSERT INTO posts (title,content,source_id,sentiment,sentiment_score,heat,hot,topic,media,published,created) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-    title, content, item.source_id || 1, a.sentiment, a.score, heat,
-    a.sentiment === 'negative' ? 1 : 0, (item.topic || '').trim() || '新增', (item.media || '').trim(), now(), now())
-  const id = Number(r.lastInsertRowid)
-  const triggered = checkAlerts(id)
-  return { id, title, sentiment: a.sentiment, score: a.score, heat, triggered }
-}
-
-// 新增舆情（单条录入，走统一管线，响应结构保持不变）
+// 新增舆情（单条录入，走统一管线，支持可选条目幂等键；响应结构保持不变）
 app.post('/api/posts', (req, res) => {
   const err = validateItem(req.body, 0)
   if (err) return res.status(400).json({ error: err })
-  const r = ingestPost(req.body)
+  const r = ingestPost(req.body, { idemKey: (req.body.idem_key || '').trim() || null })
+  if (r.duplicate) {
+    const p = q1('SELECT sentiment, heat FROM posts WHERE id=?', r.id)
+    return res.json({ ok: true, id: r.id, duplicate: true, sentiment: p?.sentiment, heat: p?.heat, triggered: [] })
+  }
   res.json({ ok: true, id: r.id, sentiment: r.sentiment, heat: r.heat, triggered: r.triggered })
 })
 
-// 批量导入：整批预校验 → 事务内逐条分析落库（预警/危机闭环与单条一致），任一失败整体回滚
-const BATCH_MAX = 200
-app.post('/api/posts/batch', (req, res) => {
+// ===== 可恢复批量导入任务 =====
+function parseFailSeqs(req) {
+  // 演练用：请求头 x-sim-fail: "2,5" → 指定条目首轮注入瞬时故障，验证自动重试
+  const raw = String(req.headers['x-sim-fail'] || '')
+  return raw.split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n))
+}
+function parseAlwaysFailSeqs(req) {
+  // 演练用：x-sim-fail-always → 每轮都失败（验证条目达到上限 → 任务 failed → 手动重试恢复）
+  const raw = String(req.headers['x-sim-fail-always'] || '')
+  return raw.split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n))
+}
+
+// 创建导入任务（任务幂等：同 idem_key 重复提交返回同一任务，不重复执行）
+app.post('/api/imports', (req, res) => {
+  const items = req.body && req.body.items
+  const jobKey = typeof req.body?.idem_key === 'string' ? req.body.idem_key.trim() : ''
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items 不能为空' })
+  if (items.length > JOB_MAX) return res.status(400).json({ error: `单次最多导入 ${JOB_MAX} 条` })
+  // 创建前整批预校验，任一不合格拒绝建任务（尚未写库）
+  const errors = items.map((it, i) => validateItem(it, i)).filter(Boolean)
+  if (errors.length) return res.status(400).json({ error: '校验失败，未创建导入任务', details: errors })
+
+  const { job, createdNow } = createJob({ idemKey: jobKey, items, failSeqs: parseFailSeqs(req), alwaysFailSeqs: parseAlwaysFailSeqs(req) })
+  if (!createdNow) {
+    return res.status(200).json({ ok: true, reused: true, jobId: job.id, job: getJob(job.id) })
+  }
+  const started = resumeJob(job.id)
+  res.status(202).json({ ok: true, jobId: job.id, status: started.status, job: getJob(job.id) })
+})
+
+// 任务列表（最近导入）
+app.get('/api/imports', (req, res) => res.json({ jobs: listJobs(20) }))
+
+// 任务详情：进度 + 逐条结果回写
+app.get('/api/imports/:id', (req, res) => {
+  const detail = getJob(+req.params.id)
+  if (!detail) return res.status(404).json({ error: '任务不存在' })
+  res.json(detail)
+})
+
+// 暂停（状态立即落库，当前块跑完后停在断点）
+app.post('/api/imports/:id/pause', (req, res) => {
+  const job = pauseJob(+req.params.id)
+  if (!job) return res.status(404).json({ error: '任务不存在' })
+  res.json({ ok: true, job: getJob(job.id) })
+})
+
+// 续跑 / 失败重试：pending 继续，failed 条目重置后续跑；幂等键保证不产生重复数据。
+// 请求头 x-clear-injection: 1 为演练用——清除持续故障注入，模拟外部依赖恢复后手动重试。
+app.post('/api/imports/:id/resume', (req, res) => {
+  const job = resumeJob(+req.params.id, { clearInjection: req.headers['x-clear-injection'] === '1' })
+  if (!job) return res.status(404).json({ error: '任务不存在' })
+  res.json({ ok: true, job: getJob(job.id) })
+})
+
+// 旧版整批接口（同步语义保留）：内部改为创建可恢复任务并等待结束，任一失败返回 207 + 逐条结果
+app.post('/api/posts/batch', async (req, res) => {
   const items = req.body && req.body.items
   if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items 不能为空' })
-  if (items.length > BATCH_MAX) return res.status(400).json({ error: `单次最多导入 ${BATCH_MAX} 条` })
-  // 先整批校验，任一不合格直接拒绝（尚未写库，无需回滚）
+  if (items.length > 200) return res.status(400).json({ error: '单次最多导入 200 条' })
   const errors = items.map((it, i) => validateItem(it, i)).filter(Boolean)
   if (errors.length) return res.status(400).json({ error: '校验失败，未导入任何数据', details: errors })
 
-  db.exec('BEGIN')
-  let results
-  try {
-    results = items.map((it) => ingestPost(it))
-    db.exec('COMMIT')
-  } catch (e) {
-    try { db.exec('ROLLBACK') } catch { /* 已提交或已回滚 */ }
-    return res.status(500).json({ error: `导入失败，已整体回滚：${e.message}` })
+  const { job } = createJob({ items, failSeqs: parseFailSeqs(req) })
+  resumeJob(job.id)
+  let detail
+  for (let i = 0; i < 6000; i++) { // 最多等待约 2 分钟
+    await new Promise((r) => setTimeout(r, 20))
+    detail = getJob(job.id)
+    if (['done', 'failed'].includes(detail.job.status)) break
   }
-  const fired = results.flatMap((r) => r.triggered)
-  res.json({
-    ok: true,
-    imported: results.length,
+  const results = detail.items.map((it) => it.result || { title: it.payload?.title, error: it.error })
+  const fired = results.flatMap((r) => r.triggered || [])
+  const body = {
+    ok: detail.job.status === 'done',
+    jobId: detail.job.id,
+    imported: detail.job.total_ok,
+    duplicates: detail.job.total_duplicate,
+    failed: detail.job.total_failed,
+    failures: detail.items.filter((it) => it.status === 'failed').map((it) => ({ seq: it.seq, error: it.error })),
     results,
     summary: {
       alerts: fired.length,
       crisesCreated: fired.filter((t) => t.crisisId && !t.deduped).length,
       crisesMerged: fired.filter((t) => t.deduped).length
     },
-    stats: statsSummary() // 统计刷新
-  })
-})
-
-function checkAlerts(postId) {
-  const p = q1('SELECT * FROM posts WHERE id=?', postId)
-  const alerts = q('SELECT * FROM alerts WHERE active=1')
-  const fired = []
-  for (const al of alerts) {
-    const kwHit = !al.keyword || (p.title + p.content).includes(al.keyword)
-    const sentHit = !al.sentiment || p.sentiment === al.sentiment
-    const heatHit = p.heat >= al.heat_min
-    if (!(kwHit && sentHit && heatHit)) continue
-    run('UPDATE alerts SET trigger_count=trigger_count+1 WHERE id=?', al.id)
-    const detail = `命中关键词「${al.keyword || '全部'}」· ${al.sentiment ? '情感：' + al.sentiment : '不限情感'} · 热度${p.heat}`
-    const ts = now()
-    const tsMs = Date.now()
-    // 归并话题：规则指定则以规则为准，否则以命中舆情的话题为准
-    const topic = (al.merge_topic || p.topic || '').trim()
-    // 闭环：高等级预警 → 危机事件。按「同话题 + 时间窗口内 + 未结案」归并；
-    // 同一规则下不同话题/超出窗口分别建档；新规则并入既有同话题事件（承接多规则）。
-    let crisisId = null, deduped = false
-    if (AUTO_LEVELS.includes(al.level) && topic) {
-      const winMs = (al.merge_window > 0 ? al.merge_window : 0) * 60000
-      let open = null
-      const cands = q("SELECT * FROM crisis WHERE topic=? AND status!='closed' ORDER BY last_trigger_at DESC, id DESC", topic)
-      for (const c of cands) {
-        const lastMs = c.last_trigger_at == null ? parseTimeMs(c.updated) : c.last_trigger_at
-        if (!winMs || (lastMs != null && tsMs - lastMs <= winMs)) { open = c; break }
-      }
-      if (open) {
-        crisisId = open.id
-        deduped = true
-        run('UPDATE crisis SET updated=?, last_trigger_at=? WHERE id=?', ts, tsMs, open.id)
-        // 该规则是否已承接此事件：决定时间线语义
-        const linked = q1('SELECT 1 FROM crisis_alerts WHERE crisis_id=? AND alert_id=?', open.id, al.id)
-        attachRule(open.id, al.id, false, ts)
-        run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
-          open.id, linked ? '预警再次触发' : '规则归并',
-          linked
-            ? `${detail} · 关联舆情《${p.title}》`
-            : `承接规则「${al.title}」（${LV_TEXT[al.level]}）：${detail} · 关联舆情《${p.title}》`, ts)
-      } else {
-        const r = run('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,alert_id,origin,topic,last_trigger_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-          al.title, al.level, 'monitoring', '',
-          `由${LV_TEXT[al.level]}预警「${al.title}」自动建档：话题「${topic}」，命中关键词「${al.keyword || '全部'}」，首条关联舆情《${p.title}》（热度${p.heat}）。`,
-          ts, ts, '', al.keyword, al.id, 'auto', topic, tsMs)
-        crisisId = Number(r.lastInsertRowid)
-        attachRule(crisisId, al.id, true, ts)
-        run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
-          crisisId, '自动建档', `高等级预警触发：${detail}`, ts)
-      }
-    }
-    const ev = run('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)',
-      al.id, postId, crisisId, detail, ts, 'open', null)
-    fired.push({ alert: al.title, level: al.level, eventId: Number(ev.lastInsertRowid), crisisId, deduped, topic })
+    stats: statsSummary()
   }
-  return fired
-}
+  res.status(detail.job.status === 'done' ? 200 : 207).json(body)
+})
 
 // ===== 热门词 =====
 app.post('/api/hotwords', (req, res) => {
@@ -389,5 +341,5 @@ app.delete('/api/crisis/:id', (req, res) => {
   res.json({ ok: true })
 })
 
-const PORT = 4130
+const PORT = Number(process.env.PORT) || 4130
 app.listen(PORT, () => console.log(`[PUBMON] API running at http://localhost:${PORT}`))

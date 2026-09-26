@@ -1,12 +1,12 @@
 import { defineStore } from 'pinia'
 
-async function api(path, method = 'GET', body, qs) {
+async function api(path, method = 'GET', body, qs, extraHeaders) {
   const url = '/api' + path + (qs ? '?' + new URLSearchParams(qs).toString() : '')
-  const opt = { method, headers: { 'Content-Type': 'application/json' } }
+  const opt = { method, headers: { 'Content-Type': 'application/json', ...(extraHeaders || {}) } }
   if (body) opt.body = JSON.stringify(body)
   const r = await fetch(url, opt)
   const data = await r.json()
-  if (!r.ok) throw new Error(data.error || '请求失败')
+  if (!r.ok) throw Object.assign(new Error(data.error || '请求失败'), { details: data.details })
   return data
 }
 
@@ -37,18 +37,14 @@ export const usePubStore = defineStore('pub', {
       } else this.msg('舆情已收录' + (r.sentiment === 'negative' ? '（负面）' : ''), 'success')
       return r
     },
-    // 批量导入：后端事务处理、失败整体回滚；成功后刷新统计并汇总提示
-    async importPosts(items) {
-      const r = await api('/posts/batch', 'POST', { items })
-      await this.load() // 统计刷新
-      const s = r.summary
-      const parts = []
-      if (s.alerts) parts.push(`触发预警 ${s.alerts} 次`)
-      if (s.crisesCreated) parts.push(`危机自动建档 ${s.crisesCreated} 起`)
-      if (s.crisesMerged) parts.push(`并入既有危机 ${s.crisesMerged} 次`)
-      this.msg(`批量导入 ${r.imported} 条舆情` + (parts.length ? '：' + parts.join('，') : ''), s.alerts ? 'warn' : 'success')
-      return r
+    // 批量导入（可恢复任务）：创建任务，返回 jobId 供轮询进度/结果
+    async createImport(items, idemKey, headers) {
+      return await api('/imports', 'POST', { items, idem_key: idemKey || undefined }, null, headers)
     },
+    async fetchImport(id) { return await api(`/imports/${id}`) },
+    async fetchImports() { return (await api('/imports')).jobs },
+    async pauseImport(id) { return await api(`/imports/${id}/pause`, 'POST') },
+    async resumeImport(id) { return await api(`/imports/${id}/resume`, 'POST') },
     async fetchAlerts() { return await api('/alerts') },
     async saveAlert(a) { await api('/alerts', 'POST', a); await this.load(); this.msg('预警规则已保存', 'success') },
     async toggleAlert(id) { await api(`/alerts/${id}/toggle`, 'POST'); await this.load() },
